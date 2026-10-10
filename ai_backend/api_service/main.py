@@ -1,0 +1,201 @@
+from utils import read_video, save_video
+from trackers import Tracker
+import cv2
+import numpy as np
+from team_assigner import TeamAssigner
+from player_ball_assigner import PlayerBallAssigner
+from camera_movement_estimator import CameraMovementEstimator
+from view_transformer import ViewTransformer
+from speed_and_distance_estimator import SpeedAndDistance_Estimator
+
+
+import argparse
+from utils import read_video, save_video
+from trackers import Tracker
+import cv2
+import numpy as np
+from team_assigner import TeamAssigner
+from player_ball_assigner import PlayerBallAssigner
+from camera_movement_estimator import CameraMovementEstimator
+from view_transformer import ViewTransformer
+from speed_and_distance_estimator import SpeedAndDistance_Estimator
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Offline 11v11 Match Tactical Tracking")
+    parser.add_argument("--input", type=str, default="input_videos/08fd33_4.mp4", help="Path to input video")
+    parser.add_argument("--no-stub", action="store_true", help="Do not use cached stubs, force recalculation")
+    parser.add_argument("--stream", action="store_true", help="Stream MJPEG video directly to stdout and suppress logs")
+    args = parser.parse_args()
+
+    import sys
+    if args.stream:
+        # Redirect all normal print() statements to stderr so they don't corrupt the MJPEG binary stream
+        sys.stdout = sys.stderr
+
+    print(f"Loading video: {args.input}")
+    # Read Video
+    video_frames = read_video(args.input)
+
+    # Initialize Tracker
+    model_path = 'models/best.pt'
+    import os
+    if not os.path.exists(model_path):
+        print(f"WARNING: {model_path} not found. Falling back to generic yolov8n.pt")
+        model_path = 'yolov8n.pt'
+    
+    tracker = Tracker(model_path)
+
+    use_stub = not args.no_stub
+    tracks = tracker.get_object_tracks(video_frames,
+                                       read_from_stub=use_stub,
+                                       stub_path='stubs/track_stubs.pkl')
+    # Get object positions 
+    tracker.add_position_to_tracks(tracks)
+
+    # camera movement estimator
+    camera_movement_estimator = CameraMovementEstimator(video_frames[0])
+    camera_movement_per_frame = camera_movement_estimator.get_camera_movement(video_frames,
+                                                                                read_from_stub=use_stub,
+                                                                                stub_path='stubs/camera_movement_stub.pkl')
+    camera_movement_estimator.add_adjust_positions_to_tracks(tracks,camera_movement_per_frame)
+
+
+    # View Trasnformer
+    view_transformer = ViewTransformer()
+    view_transformer.add_transformed_position_to_tracks(tracks)
+
+    # Interpolate Ball Positions
+    tracks["ball"] = tracker.interpolate_ball_positions(tracks["ball"])
+
+    # Speed and distance estimator
+    speed_and_distance_estimator = SpeedAndDistance_Estimator()
+    speed_and_distance_estimator.add_speed_and_distance_to_tracks(tracks)
+
+    # Assign Player Teams
+    team_assigner = TeamAssigner()
+    team_assigner.assign_team_color(video_frames[0], 
+                                    tracks['players'][0])
+    
+    for frame_num, player_track in enumerate(tracks['players']):
+        for player_id, track in player_track.items():
+            team = team_assigner.get_player_team(video_frames[frame_num],   
+                                                 track['bbox'],
+                                                 player_id)
+            tracks['players'][frame_num][player_id]['team'] = team 
+            tracks['players'][frame_num][player_id]['team_color'] = team_assigner.team_colors[team]
+
+    
+    # Assign Ball Aquisition
+    player_assigner =PlayerBallAssigner()
+    team_ball_control= []
+    individual_ball_control = {} # ADDED: track frames per player ID
+    
+    for frame_num, player_track in enumerate(tracks['players']):
+        ball_bbox = tracks['ball'][frame_num][1]['bbox']
+        assigned_player = player_assigner.assign_ball_to_player(player_track, ball_bbox)
+
+        if assigned_player != -1:
+            tracks['players'][frame_num][assigned_player]['has_ball'] = True
+            team_ball_control.append(tracks['players'][frame_num][assigned_player]['team'])
+            
+            # ADDED: log individual possession frames
+            if assigned_player not in individual_ball_control:
+                individual_ball_control[assigned_player] = 0
+            individual_ball_control[assigned_player] += 1
+        else:
+            # If no player has the ball, assign it to the last team that had it
+            if len(team_ball_control) > 0:
+                team_ball_control.append(team_ball_control[-1])
+            else:
+                team_ball_control.append(0) # fallback
+    team_ball_control= np.array(team_ball_control)
+
+
+    # Draw output 
+    ## Draw object Tracks
+    output_video_frames = tracker.draw_annotations(video_frames, tracks,team_ball_control)
+
+    ## Draw Camera movement
+    output_video_frames = camera_movement_estimator.draw_camera_movement(output_video_frames,camera_movement_per_frame)
+
+    ## Draw Speed and Distance
+    speed_and_distance_estimator.draw_speed_and_distance(output_video_frames,tracks)
+
+    # Save or Stream video
+    if args.stream:
+        # Output MJPEG stream directly to stdout
+        for frame in output_video_frames:
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret: continue
+            frame_bytes = buffer.tobytes()
+            sys.__stdout__.buffer.write(b'--frame\r\n')
+            sys.__stdout__.buffer.write(b'Content-Type: image/jpeg\r\n\r\n')
+            sys.__stdout__.buffer.write(frame_bytes)
+            sys.__stdout__.buffer.write(b'\r\n')
+            sys.__stdout__.flush()
+    else:
+        save_video(output_video_frames, 'output_videos/output_video.avi')
+
+    # ADDED: Export Tactical Data to JSON
+    import json
+    
+    tactical_stats = {
+        "team_possession": {},
+        "players": []
+    }
+    
+    # Calculate team possession
+    team_1_frames = np.sum(team_ball_control == 1)
+    team_2_frames = np.sum(team_ball_control == 2)
+    total_frames_with_possession = team_1_frames + team_2_frames
+    
+    if total_frames_with_possession > 0:
+        tactical_stats["team_possession"]["team_1"] = f"{(team_1_frames / total_frames_with_possession) * 100:.1f}%"
+        tactical_stats["team_possession"]["team_2"] = f"{(team_2_frames / total_frames_with_possession) * 100:.1f}%"
+    
+    # Aggregate player physical metrics
+    player_stats = {}
+    fps = 24 # from speed_and_distance_estimator
+    
+    for frame_num, player_track in enumerate(tracks['players']):
+        for player_id, track in player_track.items():
+            player_id_int = int(player_id)
+            if player_id_int not in player_stats:
+                player_stats[player_id_int] = {
+                    "id": player_id_int,
+                    "team": int(track.get('team', 0)),
+                    "top_speed_kmh": 0.0,
+                    "distance_covered_m": 0.0,
+                    "time_on_ball_s": 0.0
+                }
+            
+            # Update top speed
+            current_speed = float(track.get('speed', 0.0))
+            if current_speed > player_stats[player_id_int]["top_speed_kmh"]:
+                player_stats[player_id_int]["top_speed_kmh"] = round(current_speed, 2)
+                
+            # Update max distance covered (it is a running total in the track)
+            current_distance = float(track.get('distance', 0.0))
+            if current_distance > player_stats[player_id_int]["distance_covered_m"]:
+                player_stats[player_id_int]["distance_covered_m"] = round(current_distance, 2)
+    
+    # Add time on ball
+    for player_id, frames in individual_ball_control.items():
+        player_id_int = int(player_id)
+        if player_id_int in player_stats:
+            player_stats[player_id_int]["time_on_ball_s"] = round(float(frames) / fps, 2)
+            
+    players_list = list(player_stats.values())
+    # Filter out crowd/static people: must have moved
+    players_list = [p for p in players_list if p["distance_covered_m"] > 5.0]
+    # Sort by distance and keep the top 22 (the actual players on the pitch)
+    players_list = sorted(players_list, key=lambda x: x["distance_covered_m"], reverse=True)[:22]
+    tactical_stats["players"] = players_list
+    
+    with open('tactical_stats.json', 'w') as f:
+        json.dump(tactical_stats, f, indent=4)
+    print("Exported tactical stats to tactical_stats.json")
+
+if __name__ == '__main__':
+    main()
