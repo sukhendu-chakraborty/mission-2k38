@@ -30,8 +30,15 @@ class SpeedAndDistance_Estimator():
                     
                     distance_covered = measure_distance(start_position,end_position)
                     time_elapsed = (last_frame-frame_num)/self.frame_rate
-                    speed_meteres_per_second = distance_covered/time_elapsed
-                    speed_km_per_hour = speed_meteres_per_second*3.6
+                    
+                    # Physical outlier rejection: a footballer cannot run > 2.0m in 0.2s (> 36 km/h)
+                    # Any jump > 2.2m is an artifact of perspective stretch or bounding box teleportation
+                    if distance_covered > 2.2:
+                        distance_covered = min(distance_covered, 1.8)
+                        
+                    raw_speed_mps = distance_covered / max(0.001, time_elapsed)
+                    # Human sprint ceiling: Usain Bolt = 44 km/h; elite footballers peak at ~35.5 km/h
+                    speed_km_per_hour = min(35.5, max(0.0, raw_speed_mps * 3.6))
 
                     if object not in total_distance:
                         total_distance[object]= {}

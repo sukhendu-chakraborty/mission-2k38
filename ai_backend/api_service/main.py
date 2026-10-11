@@ -170,8 +170,9 @@ def main():
                     "time_on_ball_s": 0.0
                 }
             
-            # Update top speed
-            current_speed = float(track.get('speed', 0.0))
+            # Update top speed (clamped to realistic football sprint ceiling: 35.5 km/h)
+            raw_speed = float(track.get('speed', 0.0))
+            current_speed = min(35.5, max(0.0, raw_speed))
             if current_speed > player_stats[player_id_int]["top_speed_kmh"]:
                 player_stats[player_id_int]["top_speed_kmh"] = round(current_speed, 2)
                 
